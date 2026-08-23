@@ -4,6 +4,7 @@ import { streamSSE } from "hono/streaming";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { getPerchAuth } from "./auth.js";
 import { openAiErrorBody } from "./errors.js";
+import { logRequest, type RequestLogMeta } from "./logging.js";
 import { rateLimitHeaders, take } from "./ratelimit.js";
 import {
   fromDoneEvent,
@@ -115,8 +116,10 @@ async function requireSession(): Promise<Error | null> {
 }
 
 app.post("/v1/chat/completions", async (c) => {
+  const startedAt = Date.now();
   const sessionErr = await requireSession();
   if (sessionErr) {
+    logRequest(c, 401, startedAt, { error: sessionErr.message });
     return c.json(openAiErrorBody(sessionErr), 401);
   }
 
@@ -124,12 +127,14 @@ app.post("/v1/chat/completions", async (c) => {
   try {
     req = (await c.req.json()) as OpenAiChatRequest;
   } catch {
+    logRequest(c, 400, startedAt, { error: "invalid JSON" });
     return c.json(
       openAiErrorBody(new Error("Invalid JSON body")),
       400,
     );
   }
   if (!Array.isArray(req.messages) || req.messages.length === 0) {
+    logRequest(c, 400, startedAt, { error: "empty messages" });
     return c.json(
       openAiErrorBody(new Error("`messages` must be a non-empty array")),
       400,
@@ -173,12 +178,19 @@ app.post("/v1/chat/completions", async (c) => {
       for (const [k, v] of Object.entries(rateLimitHeaders(bucket, false))) {
         res.headers.set(k, v);
       }
+      logRequest(c, 200, startedAt, {
+        model: modelId,
+        served: `${result.provider}/${result.model}`,
+        input_tokens: (result.usage ?? {}).prompt_tokens ?? 0,
+        output_tokens: (result.usage ?? {}).completion_tokens ?? 0,
+      });
       return res;
     } catch (err) {
       const e = err as Error & { status?: number };
       const status = (
         e.status && e.status >= 400 && e.status < 600 ? e.status : 502
       ) as ContentfulStatusCode;
+      logRequest(c, status, startedAt, { model: modelId, error: e.message });
       return c.json(openAiErrorBody(err as Error), status);
     }
   }
@@ -187,6 +199,7 @@ app.post("/v1/chat/completions", async (c) => {
     const id = `chatcmpl-${crypto.randomUUID()}`;
     const created = Math.floor(Date.now() / 1000);
     const chunkBase = { id, object: "chat.completion.chunk", created, model: modelId };
+    const streamMeta: RequestLogMeta = { model: modelId };
 
     const sendChunk = (delta: Record<string, unknown>, finish?: string) =>
       sse.writeSSE({
@@ -203,6 +216,7 @@ app.post("/v1/chat/completions", async (c) => {
 
       for await (const ev of callStreaming(perchOpts, c.req.raw.signal)) {
         if (ev.type === "__http_error") {
+          streamMeta.error = String((ev as { message?: string }).message ?? "upstream error");
           const body = openAiErrorBody(ev as unknown as Error & { type: string });
           await sse.writeSSE({ data: JSON.stringify(body) });
           return;
@@ -241,6 +255,9 @@ app.post("/v1/chat/completions", async (c) => {
           }
           const result = fromDoneEvent(ev);
           usage = result.usage;
+          streamMeta.served = `${result.provider}/${result.model}`;
+          streamMeta.input_tokens = usage?.prompt_tokens;
+          streamMeta.output_tokens = usage?.completion_tokens;
           if (!emittedToolCalls && result.toolCalls.length) {
             for (let i = 0; i < result.toolCalls.length; i++) {
               const tc = result.toolCalls[i];
@@ -273,28 +290,37 @@ app.post("/v1/chat/completions", async (c) => {
       }
       await sendChunk({}, "stop");
     } catch (err) {
+      streamMeta.error = (err as Error).message;
       if (!c.req.raw.signal.aborted) {
         await sse
           .writeSSE({ data: JSON.stringify(openAiErrorBody(err as Error)) })
           .catch(() => {});
       }
+    } finally {
+      logRequest(c, streamMeta.error ? 502 : 200, startedAt, streamMeta);
     }
   });
 });
 
 app.post("/v1/responses", async (c) => {
+  const startedAt = Date.now();
   const sessionErr = await requireSession();
-  if (sessionErr) return c.json({ error: { message: sessionErr.message } }, 401);
+  if (sessionErr) {
+    logRequest(c, 401, startedAt, { error: sessionErr.message });
+    return c.json({ error: { message: sessionErr.message } }, 401);
+  }
 
   let req: ResponsesRequest;
   try {
     req = (await c.req.json()) as ResponsesRequest;
   } catch {
+    logRequest(c, 400, startedAt, { error: "invalid JSON" });
     return c.json({ error: { message: "Invalid JSON body" } }, 400);
   }
 
   const chatReq = responsesToChat(req);
   if (!Array.isArray(chatReq.messages) || chatReq.messages.length === 0) {
+    logRequest(c, 400, startedAt, { error: "empty input" });
     return c.json(
       { error: { message: "`input` must be a string or a non-empty array" } },
       400,
@@ -309,6 +335,12 @@ app.post("/v1/responses", async (c) => {
     try {
       const done = await callNonStreaming(perchOpts, c.req.raw.signal);
       const result = fromDoneEvent(done);
+      logRequest(c, 200, startedAt, {
+        model: modelId,
+        served: `${result.provider}/${result.model}`,
+        input_tokens: result.usage?.prompt_tokens ?? 0,
+        output_tokens: result.usage?.completion_tokens ?? 0,
+      });
       return c.json(
         buildResponseObject({
           model: modelId,
@@ -323,6 +355,7 @@ app.post("/v1/responses", async (c) => {
       const status = (
         e.status && e.status >= 400 && e.status < 600 ? e.status : 502
       ) as ContentfulStatusCode;
+      logRequest(c, status, startedAt, { model: modelId, error: e.message });
       return c.json(openAiErrorBody(err as Error), status);
     }
   }
@@ -331,6 +364,7 @@ app.post("/v1/responses", async (c) => {
     let responseId = "";
     let messageId = "";
     let outputIndex = -1;
+    const streamMeta: RequestLogMeta = { model: modelId };
     const collectedText: string[] = [];
     const collectedCalls: Array<{
       itemIndex: number;
@@ -428,6 +462,9 @@ app.post("/v1/responses", async (c) => {
           if (ev.type !== "done") continue;
           const result = fromDoneEvent(ev);
           finalUsage = result.usage;
+          streamMeta.served = `${result.provider}/${result.model}`;
+          streamMeta.input_tokens = finalUsage?.prompt_tokens;
+          streamMeta.output_tokens = finalUsage?.completion_tokens;
           await closeText();
           for (const tc of result.toolCalls) {
             outputIndex += 1;
@@ -510,6 +547,7 @@ app.post("/v1/responses", async (c) => {
       responseObject.id = responseId;
       await emit("response.completed", { response: responseObject });
     } catch (err) {
+      streamMeta.error = (err as Error).message;
       if (!c.req.raw.signal.aborted) {
         await sse
           .writeSSE({
@@ -521,6 +559,8 @@ app.post("/v1/responses", async (c) => {
           })
           .catch(() => {});
       }
+    } finally {
+      logRequest(c, streamMeta.error ? 502 : 200, startedAt, streamMeta);
     }
   });
 });

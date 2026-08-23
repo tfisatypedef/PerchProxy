@@ -192,12 +192,16 @@ Sanity checks: `/healthz` (proxy alive), `/readyz` (Perch session found).
 `--profile perch` selects the config block; without it Codex targets
 OpenAI's servers and fails.
 
-## Follow-up: proxy access log
+## Follow-up: proxy access log — DONE (2026-08-23)
+Added `src/logging.ts` + `logRequest()` calls at every terminal point of
+`/v1/chat/completions` and `/v1/responses` (success, upstream error,
+validation error, stream completion/failure). Console format:
 
-Add per-request console logging to the proxy so harness debugging is easy:
-method, path, status, duration, requested model + actually-served model
-(`perch_served`), token usage. Format:
-`[HH:MM:SS] POST /v1/responses 200 1.2s model=auto served=wandb/moonshotai/Kimi-K2.6 in=16 out=90`.
+```
+[17:20:33] POST /v1/responses 200 4.0s model=deepseek-v4-flash served=wandb/deepseek-ai/DeepSeek-V4-Flash in=6 out=46
+```
+
+Verified live against both endpoints (streaming + non-streaming).
 
 ## Usage
 
