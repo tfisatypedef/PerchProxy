@@ -140,6 +140,31 @@ Scaffold in `<project dir>`:
 - Pro-tier pinned slugs unverified until account is on Pro.
 - debug-pin.ts / debug-tools.ts kept as diagnostic utilities (npx tsx).
 
+## Phase 4 — Responses API shim for Codex CLI (2026-08-23) — COMPLETE
+
+Goal: native Codex CLI support without `wire_api = "chat"`. Codex defaults
+to the OpenAI Responses API (`POST /v1/responses`); implement a translation
+layer on top of the existing chat pipeline.
+
+1. DONE: `src/responses.ts`:
+   - Converts `input` (string or items), `instructions` → system message,
+     responses-format tools → chat tools, tool_choice object → required.
+   - Item mapping: `message` parts flattened to text, `function_call` merged
+     into adjacent assistant message as tool_calls, `function_call_output`
+     → tool message keyed by call_id; `reasoning` items skipped.
+   - Stateless: ignores `previous_response_id`/`store`.
+2. DONE: `POST /v1/responses` in server.ts, streaming + non-streaming.
+3. DONE: 7 unit tests for translation (16 total across project).
+4. DONE: Live validation:
+   - Non-streaming: status=completed, output_text correct, usage present.
+   - Streaming event sequence verified: response.created → in_progress →
+     output_item.added → content_part.added → output_text.delta* →
+     output_text.done → content_part.done → output_item.done →
+     response.completed.
+   - Tool calling via /v1/responses verified: function_call item with valid
+     JSON arguments returned.
+5. DONE: README documents native Codex setup (`~/.codex/config.toml`).
+
 ## Usage
 
 ```powershell

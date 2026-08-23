@@ -11,6 +11,11 @@ import {
   type OpenAiChatRequest,
 } from "./translate.js";
 import { callNonStreaming, callStreaming } from "./upstream.js";
+import {
+  buildResponseObject,
+  responsesToChat,
+  type ResponsesRequest,
+} from "./responses.js";
 
 const PORT = Number(process.env.PERCH_PROXY_PORT?.trim() || "8787");
 const LOCAL_KEY = process.env.PERCH_PROXY_API_KEY?.trim() || "";
@@ -271,6 +276,249 @@ app.post("/v1/chat/completions", async (c) => {
       if (!c.req.raw.signal.aborted) {
         await sse
           .writeSSE({ data: JSON.stringify(openAiErrorBody(err as Error)) })
+          .catch(() => {});
+      }
+    }
+  });
+});
+
+app.post("/v1/responses", async (c) => {
+  const sessionErr = await requireSession();
+  if (sessionErr) return c.json({ error: { message: sessionErr.message } }, 401);
+
+  let req: ResponsesRequest;
+  try {
+    req = (await c.req.json()) as ResponsesRequest;
+  } catch {
+    return c.json({ error: { message: "Invalid JSON body" } }, 400);
+  }
+
+  const chatReq = responsesToChat(req);
+  if (!Array.isArray(chatReq.messages) || chatReq.messages.length === 0) {
+    return c.json(
+      { error: { message: "`input` must be a string or a non-empty array" } },
+      400,
+    );
+  }
+
+  const bucket = take("global");
+  const perchOpts = toPerchOptions(chatReq);
+  const modelId = req.model ?? "auto";
+
+  if (!req.stream) {
+    try {
+      const done = await callNonStreaming(perchOpts, c.req.raw.signal);
+      const result = fromDoneEvent(done);
+      return c.json(
+        buildResponseObject({
+          model: modelId,
+          text: result.text,
+          toolCalls: result.toolCalls,
+          usage: result.usage,
+        }),
+        200,
+      );
+    } catch (err) {
+      const e = err as Error & { status?: number };
+      const status = (
+        e.status && e.status >= 400 && e.status < 600 ? e.status : 502
+      ) as ContentfulStatusCode;
+      return c.json(openAiErrorBody(err as Error), status);
+    }
+  }
+
+  return streamSSE(c, async (sse) => {
+    let responseId = "";
+    let messageId = "";
+    let outputIndex = -1;
+    const collectedText: string[] = [];
+    const collectedCalls: Array<{
+      itemIndex: number;
+      callId: string;
+      name: string;
+      args: string;
+      itemId: string;
+    }> = [];
+    let textClosed = false;
+
+    const emit = (event: string, data: unknown) =>
+      sse.writeSSE({ event, data: JSON.stringify(data) });
+
+    try {
+      responseId = `resp_${crypto.randomUUID().replace(/-/g, "").slice(0, 20)}`;
+      await emit("response.created", {
+        response: { id: responseId, object: "response", status: "in_progress", model: modelId },
+      });
+      await emit("response.in_progress", {
+        response: { id: responseId, status: "in_progress" },
+      });
+
+      const closeText = async () => {
+        if (textClosed || !messageId) return;
+        textClosed = true;
+        await emit("response.output_text.done", {
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          text: collectedText.join(""),
+        });
+        await emit("response.content_part.done", {
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: collectedText.join(""), annotations: [] },
+        });
+        await emit("response.output_item.done", {
+          output_index: 0,
+          item: {
+            type: "message",
+            id: messageId,
+            role: "assistant",
+            status: "completed",
+            content: [
+              { type: "output_text", text: collectedText.join(""), annotations: [] },
+            ],
+          },
+        });
+      };
+
+      let finalUsage: Record<string, number> | null = null;
+
+      for await (const ev of callStreaming(perchOpts, c.req.raw.signal)) {
+        if (ev.type === "__http_error") {
+          await sse.writeSSE({
+            event: "response.failed",
+            data: JSON.stringify({
+              response: { id: responseId, status: "failed" },
+              error: openAiErrorBody(ev as unknown as Error & { type: string }).error,
+            }),
+          });
+          return;
+        }
+        if (ev.type === "answer_delta" && typeof ev.text === "string") {
+          if (!messageId) {
+            messageId = `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+            outputIndex += 1;
+            await emit("response.output_item.added", {
+              output_index: outputIndex,
+              item: {
+                type: "message",
+                id: messageId,
+                role: "assistant",
+                status: "in_progress",
+                content: [],
+              },
+            });
+            await emit("response.content_part.added", {
+              item_id: messageId,
+              output_index: outputIndex,
+              content_index: 0,
+              part: { type: "output_text", text: "", annotations: [] },
+            });
+          }
+          collectedText.push(ev.text);
+          await emit("response.output_text.delta", {
+            item_id: messageId,
+            output_index: outputIndex,
+            content_index: 0,
+            delta: ev.text,
+          });
+        } else if (ev.type === "tool_use_end" || ev.type === "done") {
+          if (ev.type === "tool_use_end") await closeText();
+          if (ev.type !== "done") continue;
+          const result = fromDoneEvent(ev);
+          finalUsage = result.usage;
+          await closeText();
+          for (const tc of result.toolCalls) {
+            outputIndex += 1;
+            const itemId = `fc_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+            await emit("response.output_item.added", {
+              output_index: outputIndex,
+              item: {
+                type: "function_call",
+                id: itemId,
+                call_id: tc.id,
+                name: tc.function.name,
+                arguments: "",
+                status: "in_progress",
+              },
+            });
+            await emit("response.function_call_arguments.delta", {
+              item_id: itemId,
+              output_index: outputIndex,
+              delta: tc.function.arguments,
+            });
+            await emit("response.function_call_arguments.done", {
+              item_id: itemId,
+              output_index: outputIndex,
+              arguments: tc.function.arguments,
+            });
+            await emit("response.output_item.done", {
+              output_index: outputIndex,
+              item: {
+                type: "function_call",
+                id: itemId,
+                call_id: tc.id,
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+                status: "completed",
+              },
+            });
+            collectedCalls.push({
+              itemIndex: outputIndex,
+              callId: tc.id,
+              name: tc.function.name,
+              args: tc.function.arguments,
+              itemId,
+            });
+          }
+          const responseObject = buildResponseObject({
+            model: modelId,
+            text: collectedText.join(""),
+            toolCalls: collectedCalls.map((x) => ({
+              id: x.callId,
+              type: "function" as const,
+              function: { name: x.name, arguments: x.args },
+            })),
+            usage: finalUsage,
+          });
+          responseObject.id = responseId;
+          await emit("response.completed", { response: responseObject });
+          return;
+        } else if (ev.type === "error") {
+          await sse.writeSSE({
+            event: "response.failed",
+            data: JSON.stringify({
+              response: { id: responseId, status: "failed" },
+              error: openAiErrorBody(
+                Object.assign(new Error(String(ev.message ?? "Stream error")), {
+                  type: "api_error",
+                }),
+              ).error,
+            }),
+          });
+          return;
+        }
+      }
+      await closeText();
+      const responseObject = buildResponseObject({
+        model: modelId,
+        text: collectedText.join(""),
+        toolCalls: [],
+        usage: null,
+      });
+      responseObject.id = responseId;
+      await emit("response.completed", { response: responseObject });
+    } catch (err) {
+      if (!c.req.raw.signal.aborted) {
+        await sse
+          .writeSSE({
+            event: "response.failed",
+            data: JSON.stringify({
+              response: { id: responseId, status: "failed" },
+              error: openAiErrorBody(err as Error).error,
+            }),
+          })
           .catch(() => {});
       }
     }

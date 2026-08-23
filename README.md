@@ -76,6 +76,30 @@ Point your harness at `http://localhost:8787/v1`. Example for opencode
 }
 ```
 
+## Codex CLI
+
+The proxy implements the OpenAI **Responses API** (`/v1/responses`) natively,
+so Codex CLI works out of the box:
+
+```toml
+# ~/.codex/config.toml
+[model_providers.perch]
+name = "Perch Proxy"
+base_url = "http://localhost:8787/v1"
+env_key = "PERCH_DUMMY_KEY"   # any env var name; value is ignored
+
+[profiles.perch]
+model_provider = "perch"
+model = "auto"
+```
+
+```powershell
+$env:PERCH_DUMMY_KEY = "x"
+codex --profile perch
+```
+
+Plain `wire_api = "chat"` providers against the same base URL also work.
+
 ## Models
 
 `GET /v1/models` lists the registry. `model: "auto"` uses Perch's Roost

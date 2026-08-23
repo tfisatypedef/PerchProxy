@@ -1,6 +1,6 @@
 import type { PerchCallOptions, PerchTool } from "./upstream.js";
 
-type OpenAiMessage = {
+export type OpenAiMessage = {
   role: string;
   content?: unknown;
   tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>;
