@@ -165,6 +165,40 @@ layer on top of the existing chat pipeline.
      JSON arguments returned.
 5. DONE: README documents native Codex setup (`~/.codex/config.toml`).
 
+### Codex CLI usage walkthrough (2026-08-23)
+
+One-time: `npm install -g @openai/codex`; create
+`%USERPROFILE%\.codex\config.toml`:
+
+```toml
+[model_providers.perch]
+name = "Perch Proxy"
+base_url = "http://localhost:8787/v1"
+env_key = "PERCH_DUMMY_KEY"
+
+[profiles.perch]
+model_provider = "perch"
+model = "auto"
+```
+
+Every session:
+1. Terminal 1: `cd <proxy dir>; npm start` → wait for
+   `perch-proxy listening on http://localhost:8787/v1`.
+2. Terminal 2:
+   `$env:PERCH_DUMMY_KEY = "anything"` (value ignored; Codex just needs a key),
+   then `codex --profile perch`.
+
+Sanity checks: `/healthz` (proxy alive), `/readyz` (Perch session found).
+`--profile perch` selects the config block; without it Codex targets
+OpenAI's servers and fails.
+
+## Follow-up: proxy access log
+
+Add per-request console logging to the proxy so harness debugging is easy:
+method, path, status, duration, requested model + actually-served model
+(`perch_served`), token usage. Format:
+`[HH:MM:SS] POST /v1/responses 200 1.2s model=auto served=wandb/moonshotai/Kimi-K2.6 in=16 out=90`.
+
 ## Usage
 
 ```powershell
