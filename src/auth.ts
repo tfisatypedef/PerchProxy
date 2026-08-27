@@ -16,6 +16,7 @@ const EXPIRY_SKEW_MS = 120_000;
 
 const cache = {
   path: "",
+  mtimeMs: 0,
   accessToken: null as string | null,
   refreshToken: null as string | null,
   expiresAt: 0,
@@ -36,16 +37,14 @@ function candidateDirs(): string[] {
   return [...new Set(dirs)];
 }
 
-async function newestSessionFile(): Promise<string | null> {
-  let best: string | null = null;
-  let bestMtime = -1;
+async function newestSessionFile(): Promise<{ path: string; mtimeMs: number } | null> {
+  let best: { path: string; mtimeMs: number } | null = null;
   for (const dir of candidateDirs()) {
     const path = join(dir, SESSION_FILENAME);
     try {
       const s = await stat(path);
-      if (s.size > 0 && s.mtimeMs > bestMtime) {
-        bestMtime = s.mtimeMs;
-        best = path;
+      if (s.size > 0 && (!best || s.mtimeMs > best.mtimeMs)) {
+        best = { path, mtimeMs: s.mtimeMs };
       }
     } catch {}
   }
@@ -71,24 +70,36 @@ function parseExpiry(expiresAt: unknown): number {
 }
 
 async function loadSession(forcePathCheck: boolean): Promise<void> {
-  const path = await newestSessionFile();
-  if (!path) {
+  const found = await newestSessionFile();
+  if (!found) {
     cache.accessToken = null;
     cache.refreshToken = null;
     cache.expiresAt = 0;
     cache.source = `no ${SESSION_FILENAME} found`;
     return;
   }
-  if (!forcePathCheck && path === cache.path && cache.accessToken) return;
+  const { path, mtimeMs } = found;
+  // Re-read if the file path changed, the file was rewritten in place
+  // (e.g. Perch Desktop re-logged in), or the caller forced a re-check.
+  if (
+    !forcePathCheck &&
+    path === cache.path &&
+    mtimeMs === cache.mtimeMs &&
+    cache.accessToken
+  ) {
+    return;
+  }
   try {
     const parsed = JSON.parse(await readFile(path, "utf8")) as SessionFile;
     cache.path = path;
+    cache.mtimeMs = mtimeMs;
     cache.accessToken = parsed.accessToken ?? null;
     cache.refreshToken = parsed.refreshToken ?? null;
     cache.expiresAt = parseExpiry(parsed.expiresAt);
     cache.source = path;
   } catch {
     cache.path = path;
+    cache.mtimeMs = mtimeMs;
     cache.accessToken = null;
     cache.source = `${path} (unreadable)`;
   }
