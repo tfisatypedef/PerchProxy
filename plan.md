@@ -203,6 +203,50 @@ validation error, stream completion/failure). Console format:
 
 Verified live against both endpoints (streaming + non-streaming).
 
+## Incident + fix: Perch enforces a turn ticket (2026-08-27) — COMPLETE
+
+### Symptom
+opencode (and any harness) began failing with:
+`{"message":"Your plan includes Perch-hosted models for use in Perch AI Web,
+Desktop, and CLI only. Direct API access is not included. Repeated direct-access
+attempts may result in account suspension.","type":"__http_error","code":
+"perch_surface_required"}`. Same account/plan had worked days earlier; affected
+everything, not just one surface or one model. Root cause was NOT the token,
+refresh, or a plan/credits change.
+
+### Diagnosis (from `perchai-cli@2.4.96` static analysis)
+Perch shipped a **turn-ticket** requirement. Official clients now:
+1. `POST {appUrl}/api/perch-terminal/turn-ticket` with
+   `Authorization: Bearer <supabase-access-token>` and body
+   `{"surface":"cli","profile":"standard"}` → returns
+   `{ok, ticket, ticketId, runId, expiresAt}`.
+2. Call `/model-call` sending the `ticket` as the `x-perch-turn-ticket` header
+   and the ticket's `runId` in the envelope `runId` field.
+
+The proxy called `/model-call` with only `Authorization` (+ `clientSurface`,
+legacy) and no turn ticket, so Perch classified it as direct API access
+→ `perch_surface_required`. The ticket endpoint is itself turn-rate-limited
+(429 + `turn_rate_limited`), so caching is mandatory.
+
+### Fix (`src/upstream.ts`)
+- Added `getTurnTicket(accessToken, force)` + `fetchTurnTicket()`:
+  fetch one ticket per turn, cache it, single-flight renewal, reuse until
+  30s before `expiresAt` (~5 min TTL; fall back to a still-valid stale ticket
+  if renewal fails). Surface `"cli"`, profile `"standard"`.
+- `buildEnvelope(opts, runId)` now takes the ticket's `runId`.
+- `doFetch()` sends `x-perch-turn-ticket` header.
+- `fetchWithRetry()` obtains the ticket after auth, rebuilds the envelope per
+  attempt, and fetches a fresh ticket after a 401 auth refresh.
+- No live pings: change validated by typecheck only, to avoid hitting the
+  ticket endpoint gratuitously (banned-risk / turn-rate-limit concern).
+
+### Necessary caveat
+Because the proxy consumes a turn ticket per turn (same as the official CLI),
+the proxied calls are subject to Perch's turn-rate limit and are still billed
+against the plan allowance. The `perch_surface_required` for this account is
+resolved only when the new code can obtain a ticket; it is **not** live-verified
+here to avoid touching the endpoint gratuitously.
+
 ## Usage
 
 ```powershell

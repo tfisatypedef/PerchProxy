@@ -32,7 +32,7 @@ export function classifyUpstreamError(
       msg = (parsed.error as Record<string, unknown>).message as string;
     }
     if (typeof parsed.errorCode === "string") errorCode = parsed.errorCode;
-  } catch {}
+  } catch { }
 
   const mapped = STATUS_TYPE[status];
   let type = mapped?.type ?? (status >= 500 ? "api_error" : "invalid_request_error");

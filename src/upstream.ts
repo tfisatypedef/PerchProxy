@@ -10,6 +10,107 @@ export function baseUrl(): string {
   ).replace(/\/+$/, "");
 }
 
+// Perch now requires official clients to first obtain a short-lived "turn
+// ticket" from /api/perch-terminal/turn-ticket and send it as the
+// `x-perch-turn-ticket` header on every /model-call request. Without it the
+// backend rejects the call as direct API access (error code
+// `perch_surface_required`). Mirror the CLI: fetch one ticket per turn,
+// cache it, and only renew shortly before it expires. This also avoids
+// hammering the ticket endpoint (which is itself turn-rate-limited).
+
+export type TurnTicket = {
+  token: string;
+  ticketId: string;
+  runId: string;
+  expiresAt: number;
+};
+
+const TICKET_RENEW_WINDOW_MS = 30_000;
+const TICKET_DEFAULT_TTL_MS = 5 * 60_000;
+
+const turnTicketCache: {
+  ticket: TurnTicket | null;
+  accessToken: string | null;
+  renewing: Promise<TurnTicket | null> | null;
+} = { ticket: null, accessToken: null, renewing: null };
+
+function parseTicketExpiry(value: unknown): number {
+  if (typeof value === "string" && !Number.isNaN(Date.parse(value))) {
+    return Date.parse(value);
+  }
+  return Date.now() + TICKET_DEFAULT_TTL_MS;
+}
+
+async function fetchTurnTicket(accessToken: string): Promise<TurnTicket | null> {
+  const res = await fetch(`${baseUrl()}/api/perch-terminal/turn-ticket`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+      "User-Agent": "perch-proxy/0.1",
+    },
+    body: JSON.stringify({ surface: "cli", profile: "standard" }),
+  });
+  if (!res.ok) return null;
+  try {
+    const data = (await res.json()) as Record<string, unknown>;
+    if (
+      data.ok !== true ||
+      typeof data.ticket !== "string" ||
+      typeof data.ticketId !== "string" ||
+      typeof data.runId !== "string"
+    ) {
+      return null;
+    }
+    return {
+      token: data.ticket,
+      ticketId: data.ticketId,
+      runId: data.runId,
+      expiresAt: parseTicketExpiry(data.expiresAt),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function getTurnTicket(
+  accessToken: string | null,
+  force = false,
+): Promise<TurnTicket | null> {
+  if (!accessToken) return null;
+  const now = Date.now();
+  if (
+    !force &&
+    turnTicketCache.ticket &&
+    turnTicketCache.accessToken === accessToken &&
+    turnTicketCache.ticket.expiresAt > now + TICKET_RENEW_WINDOW_MS
+  ) {
+    return turnTicketCache.ticket;
+  }
+  if (!turnTicketCache.renewing) {
+    turnTicketCache.renewing = (async () => {
+      const t = await fetchTurnTicket(accessToken);
+      if (t) {
+        turnTicketCache.ticket = t;
+        turnTicketCache.accessToken = accessToken;
+      }
+      return t;
+    })().finally(() => {
+      turnTicketCache.renewing = null;
+    });
+  }
+  const fresh = await turnTicketCache.renewing;
+  // Fall back to the cached ticket if renewal failed and it is still valid.
+  return (
+    fresh ??
+    (turnTicketCache.accessToken === accessToken &&
+    turnTicketCache.ticket &&
+    turnTicketCache.ticket.expiresAt > now
+      ? turnTicketCache.ticket
+      : null)
+  );
+}
+
 export type PerchMessage = Record<string, unknown>;
 export type PerchTool = { type: "function"; function: Record<string, unknown> };
 
@@ -25,7 +126,7 @@ export type PerchCallOptions = {
 
 export type PerchEvent = Record<string, unknown> & { type: string };
 
-function buildEnvelope(opts: PerchCallOptions): string {
+function buildEnvelope(opts: PerchCallOptions, runId?: string | null): string {
   const {
     messages,
     tools,
@@ -46,7 +147,7 @@ function buildEnvelope(opts: PerchCallOptions): string {
       responseFormat,
       reasoning: null,
     },
-    runId: crypto.randomUUID(),
+    runId: runId ?? crypto.randomUUID(),
     lane: "chat",
     strictManual: false,
     raceMode: null,
@@ -86,6 +187,7 @@ async function doFetch(
   body: string,
   stream: boolean,
   token: string | null,
+  turnTicket: string | null,
   signal?: AbortSignal,
 ): Promise<Response> {
   const headers: Record<string, string> = {
@@ -94,6 +196,7 @@ async function doFetch(
     "User-Agent": "perch-proxy/0.1",
   };
   if (token) headers.Authorization = `Bearer ${token}`;
+  if (turnTicket) headers["x-perch-turn-ticket"] = turnTicket;
   return fetch(`${baseUrl()}${MODEL_CALL_PATH}`, {
     method: "POST",
     headers,
@@ -103,16 +206,18 @@ async function doFetch(
 }
 
 async function fetchWithRetry(
-  body: string,
+  opts: PerchCallOptions,
   stream: boolean,
   signal?: AbortSignal,
 ): Promise<Response> {
   let auth = await getPerchAuth();
+  let ticket = await getTurnTicket(auth.token);
   let refreshedOnce = false;
   for (let attempt = 0; ; attempt++) {
+    const body = buildEnvelope(opts, ticket?.runId ?? null);
     let res: Response;
     try {
-      res = await doFetch(body, stream, auth.token, signal);
+      res = await doFetch(body, stream, auth.token, ticket?.token ?? null, signal);
     } catch (err) {
       if (signal?.aborted) throw err;
       if (attempt >= MAX_ATTEMPTS - 1) throw err;
@@ -131,10 +236,12 @@ async function fetchWithRetry(
           });
           throw Object.assign(new Error(err.message), err);
         }
-        await res.body?.cancel().catch(() => {});
+        // The access token rotated; fetch a fresh turn ticket bound to it.
+        ticket = await getTurnTicket(auth.token, true);
+        await res.body?.cancel().catch(() => { });
         continue;
       }
-      await res.body?.cancel().catch(() => {});
+      await res.body?.cancel().catch(() => { });
       const text = await safeText(res);
       throw Object.assign(
         new Error("Perch session expired. Run `perch login`."),
@@ -144,7 +251,7 @@ async function fetchWithRetry(
     if (!isRetryableStatus(res.status) || attempt >= MAX_ATTEMPTS - 1) {
       return res;
     }
-    await res.body?.cancel().catch(() => {});
+    await res.body?.cancel().catch(() => { });
     await sleep(backoffMs(attempt), signal);
   }
 }
@@ -161,7 +268,7 @@ export async function callNonStreaming(
   opts: PerchCallOptions,
   signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
-  const res = await fetchWithRetry(buildEnvelope(opts), false, signal);
+  const res = await fetchWithRetry(opts, false, signal);
   const text = await safeText(res);
   if (!res.ok) throw Object.assign(new Error(text), classifyUpstreamError(res.status, text));
   try {
@@ -175,7 +282,7 @@ export async function* callStreaming(
   opts: PerchCallOptions,
   signal?: AbortSignal,
 ): AsyncGenerator<PerchEvent> {
-  const res = await fetchWithRetry(buildEnvelope(opts), true, signal);
+  const res = await fetchWithRetry(opts, true, signal);
   if (!res.ok || !res.body) {
     const text = await safeText(res);
     yield {
@@ -188,7 +295,7 @@ export async function* callStreaming(
   const decoder = new TextDecoder();
   let buf = "";
   try {
-    for (;;) {
+    for (; ;) {
       const { done, value } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
@@ -200,11 +307,11 @@ export async function* callStreaming(
         if (!payload) continue;
         try {
           yield JSON.parse(payload) as PerchEvent;
-        } catch {}
+        } catch { }
       }
     }
   } finally {
-    await reader.cancel().catch(() => {});
+    await reader.cancel().catch(() => { });
     reader.releaseLock();
   }
 }

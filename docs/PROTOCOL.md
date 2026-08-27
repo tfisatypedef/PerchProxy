@@ -16,6 +16,25 @@ validation through a working proxy, 2026-08-23.
 
   Base URL can be overridden via env `PERCH_MODEL_CALL_PROXY_URL`; bearer
   token via `PERCH_MODEL_CALL_PROXY_TOKEN`.
+- **Turn ticket (required since late Aug 2026):** official clients must first
+  obtain a short-lived "turn ticket" and attach it to every model call,
+  otherwise the backend returns `perch_surface_required` ("Direct API access
+  is not included"). Without the ticket the model-call is treated as direct
+  API access:
+  ```
+  POST https://app.perchai.app/api/perch-terminal/turn-ticket
+  Authorization: Bearer <supabase-access-token>
+  Content-Type: application/json
+  {"surface": "cli", "profile": "standard"}
+
+  → 200 {"ok": true, "ticket": "<signed>", "ticketId": "<id>",
+         "runId": "<id>", "expiresAt": "<ISO>", "profile": "standard"}
+  ```
+  The returned `ticket` is then sent as the `x-perch-turn-ticket` header on
+  the model call, and the ticket's `runId` is set as `runId` in the request
+  body. Tickets are cached and renewed (single-flight) shortly before their
+  ~5 min expiry. The ticket endpoint is itself turn-rate-limited (429 +
+  `turn_rate_limited`).
 - Auth is Supabase (auth-js, PKCE browser login). Session persisted at:
   - `%USERPROFILE%\.perch\cli-auth-session.json` (override dir:
     `PERCH_CLI_AUTH_DIR`)
@@ -45,6 +64,7 @@ Headers:
   Content-Type: application/json
   Accept: text/event-stream        // when streaming
   Authorization: Bearer <supabase-access-token>   // may be absent for anon?
+  x-perch-turn-ticket: <turn-ticket>               // REQUIRED (else perch_surface_required)
 
 Body:
 {
@@ -122,7 +142,8 @@ The `done` event also carries Anthropic-style content blocks:
 
 Error codes seen: `provider_not_configured`, `api_error`, `timeout`,
 `parse_error`, `usage_limit_reached`, `starter_model_blocked`,
-`promo_overflow_decision`.
+`promo_overflow_decision`, `perch_surface_required` (missing/invalid turn
+ticket), `turn_rate_limited` (turn-ticket endpoint 429).
 
 HTTP error body: `{ "error": "...", "errorCode"?: "..." }`.
 429 = usage limit reached. 403 + "Upgrade to Pro" = starter_model_blocked
