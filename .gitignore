@@ -9,4 +9,6 @@ dist/
 .perch/
 .commandcode/
 .zcode/
+$COMMANDCODE_SCRATCHPAD/
+-p/
 scratch_cli/
