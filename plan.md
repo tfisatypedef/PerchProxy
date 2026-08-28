@@ -247,6 +247,85 @@ against the plan allowance. The `perch_surface_required` for this account is
 resolved only when the new code can obtain a ticket; it is **not** live-verified
 here to avoid touching the endpoint gratuitously.
 
+## Extension: Command Code hosted lane (2026-08-28) — COMPLETE (free lane live-verified)
+
+### Goal
+Extend the proxy with a second upstream: the hosted ("subscription") lane of
+the `command-code` CLI (npm `command-code@1.36.0`), so its models — including
+the free lane (`minimax/minimax-m3-free` etc.) — are servable through the same
+OpenAI-compatible `/v1` endpoints. Protocol spec:
+[`docs/COMMANDCODE-PROTOCOL.md`](docs/COMMANDCODE-PROTOCOL.md).
+
+### Recon findings (static, `dist/cli.mjs` + live probes)
+- Hosted inference: `POST https://api.commandcode.ai/alpha/generate` (staging
+  `staging-api.commandcode.ai`, local `localhost:9090`). NDJSON request and
+  response (not SSE). Anthropic-style wire: user/assistant `content` block
+  arrays (`text`, `tool_use`, `tool_result`), tools as
+  `{name, description, input_schema}`, separate `system` string.
+- Envelope: required `config` (workingDir, date, environment, structure,
+  isGitRepo, currentBranch, mainBranch, gitStatus, recentCommits — schema
+  extracted from the server's 400 validation hints) + `memory`; optional
+  `taste`, `skills`, `permissionMode` ("default"), `threadId` (uuid), `mode`
+  ("agent"). `params`: model, messages, tools, system, max_tokens (CLI
+  default 64000), stream, temperature?, reasoning_effort?.
+- Auth: static, non-expiring API key in `~/.commandcode/auth.json`
+  (`cmdc login` → browser → localhost:5959 callback). Sent as
+  `Authorization: Bearer`; plus `User-Agent: cli`, `x-cli-environment: prod`,
+  `x-command-code-version: 1.36.0`. No refresh/rotation.
+- Response events (authoritative: CLI's own `consumeStream`):
+  `start`, `text-delta{text}`, `reasoning-start/-delta{text}/-end`,
+  `tool-call{toolCallId, toolName, input}`, `tool-result`, `abort`,
+  `finish{finishReason, rawFinishReason, totalUsage{inputTokens, outputTokens,
+  inputTokenDetails{...}}, systemPromptTokens}`,
+  `error{error:{type, message, statusCode, isRetryable}}`.
+- No hosted `/models` endpoint; catalog hardcoded in the client
+  (`vendor/model` ids). Free lane ids: minimax-m3-free, minimax-m2.7-free,
+  muse-spark-1.1/1.2, laguna-s-2.1-free, ling-3.0-flash-free.
+- BYOK lane (reference): `~/.commandcode/providers.json` supports only
+  `openai-completions` and `anthropic-messages` wires (no Responses API);
+  apiKey must be `$ENV`/`{env:VAR}`/`!command` reference. This is also the
+  zero-code path to point command-code itself at perch-proxy.
+
+### Implementation
+- `src/commandcode.ts`: auth (reads `~/.commandcode/auth.json`, cache 2s;
+  `COMMANDCODE_API_KEY` / `COMMANDCODE_AUTH_DIR` / `COMMANDCODE_API_BASE_URL`
+  env overrides), OpenAI→CC message/tool/envelope translation, NDJSON stream
+  parser normalizing to the same events the Perch upstream emits
+  (`answer_delta`, `reasoning_delta`, `tool_use_end`, `done`, `error`),
+  non-streaming by stream aggregation. Errors reuse `classifyUpstreamError`.
+- `src/server.ts`: `selectUpstream()` routes by model id — ids in
+  `CC_MODEL_LIST` (six free-lane slugs) go to Command Code, everything else to
+  Perch unchanged. `/v1/models` merges both registries (401 only when neither
+  session nor CC key exists); auth gate per upstream in
+  `/v1/chat/completions` and `/v1/responses`.
+- Tests: 8 new in `test/commandcode.test.ts` (24 total) — message/tool
+  mapping, envelope shape, option precedence.
+
+### Live validation (upstream request accounting)
+1. `GET /alpha/whoami` → 200 `{success, user{...}}` (no tokens billed).
+2. Four `POST /alpha/generate` envelope probes: 400×2 (validation hints used
+   to pin the `config` schema, no tokens billed), then 200 with
+   `{"type":"start"}` + retryable `503 server_error` mid-stream ×3 (free-lane
+   pool was down; no tokens billed).
+3. Through the proxy, `minimax/minimax-m3-free`, "Say OK", max_tokens 16:
+   - Non-streaming: **200, `content:"OK"`, finish_reason stop, usage
+     7431/1 tokens** (prompt count is upstream-side scaffolding), served
+     `command-code/minimax/minimax-m3-free`. ✅
+   - Streaming: correct OpenAI chunk framing; the flaky lane 503'd mid-stream
+     and the proxy correctly emitted an OpenAI-style error chunk before close
+     (same behavior as the Perch error path). ✅ error path
+   - Total billed output across probes: ~1 token. Per user constraint, only
+     the free lane was touched.
+
+### Notes / limitations
+- The free lane's model pool intermittently 503s (observed in the official
+  CLI too; the CLI retries internally). The proxy surfaces the error to the
+  client instead of retrying mid-stream (retrying after partial output would
+  duplicate content). Harness-level retries handle it.
+- CC lane supports text + tools; image inputs are not translated in v1.
+- `finish.finishReason` "tool-calls"/"length" mapping available on the done
+  event; finish_reason derived from tool-call presence as in the Perch path.
+
 ## Usage
 
 ```powershell

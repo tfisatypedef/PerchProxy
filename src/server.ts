@@ -11,7 +11,14 @@ import {
   toPerchOptions,
   type OpenAiChatRequest,
 } from "./translate.js";
-import { callNonStreaming, callStreaming } from "./upstream.js";
+import { callNonStreaming, callStreaming, type PerchCallOptions, type PerchEvent } from "./upstream.js";
+import {
+  callNonStreamingCc,
+  callStreamingCc,
+  getCcAuth,
+  toCcOptions,
+  type CcCallOptions,
+} from "./commandcode.js";
 import {
   buildResponseObject,
   responsesToChat,
@@ -48,6 +55,50 @@ const MODEL_LIST: Record<string, string> = {
 
 const app = new Hono();
 
+// Command Code hosted-lane models (docs/COMMANDCODE-PROTOCOL.md). Routed by
+// id — anything not in this list goes to the Perch upstream as before.
+const CC_MODEL_LIST: Record<string, string> = {
+  "minimax/minimax-m3-free": "MiniMax M3 (Command Code free)",
+  "minimax/minimax-m2.7-free": "MiniMax M2.7 (Command Code free)",
+  "meta/muse-spark-1.1": "Muse Spark 1.1 (Command Code free)",
+  "meta/muse-spark-1.2": "Muse Spark 1.2 (Command Code free)",
+  "poolside/laguna-s-2.1-free": "Laguna S 2.1 (Command Code free)",
+  "inclusionai/ling-3.0-flash-free": "Ling 3.0 Flash (Command Code free)",
+};
+
+function isCommandCodeModel(model?: string): boolean {
+  return !!model && model in CC_MODEL_LIST;
+}
+
+type AnyUpstreamOpts = PerchCallOptions | CcCallOptions;
+type NonStreamingFn = (
+  opts: AnyUpstreamOpts,
+  signal?: AbortSignal,
+) => Promise<Record<string, unknown>>;
+type StreamingFn = (
+  opts: AnyUpstreamOpts,
+  signal?: AbortSignal,
+) => AsyncGenerator<PerchEvent>;
+
+function selectUpstream(model: string): {
+  cc: boolean;
+  nonStreaming: NonStreamingFn;
+  streaming: StreamingFn;
+} {
+  if (isCommandCodeModel(model)) {
+    return {
+      cc: true,
+      nonStreaming: callNonStreamingCc as unknown as NonStreamingFn,
+      streaming: callStreamingCc as unknown as StreamingFn,
+    };
+  }
+  return {
+    cc: false,
+    nonStreaming: callNonStreaming as unknown as NonStreamingFn,
+    streaming: callStreaming as unknown as StreamingFn,
+  };
+}
+
 app.use("*", async (c, next) => {
   if (!LOCAL_KEY) return next();
   const auth = c.req.header("Authorization") ?? "";
@@ -81,12 +132,12 @@ app.get("/readyz", async (c) => {
 });
 
 app.get("/v1/models", async (c) => {
-  const auth = await getPerchAuth();
-  if (!auth.token) {
+  const [auth, ccAuth] = await Promise.all([getPerchAuth(), getCcAuth()]);
+  if (!auth.token && !ccAuth) {
     return c.json(
       {
         error: {
-          message: "No Perch session. Run `perch login`.",
+          message: "No Perch session (`perch login`) and no Command Code key (`cmdc login`).",
           type: "authentication_error",
           code: null,
         },
@@ -94,16 +145,25 @@ app.get("/v1/models", async (c) => {
       401,
     );
   }
-  return c.json({
-    object: "list",
-    data: Object.entries(MODEL_LIST).map(([id, label]) => ({
-      id,
-      object: "model",
-      created: 0,
-      owned_by: id === "auto" ? "perch-roost" : "perch",
-      meta: { description: label },
-    })),
-  });
+  const data = Object.entries(MODEL_LIST).map(([id, label]) => ({
+    id,
+    object: "model",
+    created: 0,
+    owned_by: id === "auto" ? "perch-roost" : "perch",
+    meta: { description: label },
+  }));
+  if (ccAuth) {
+    data.push(
+      ...Object.entries(CC_MODEL_LIST).map(([id, label]) => ({
+        id,
+        object: "model",
+        created: 0,
+        owned_by: "command-code",
+        meta: { description: label },
+      })),
+    );
+  }
+  return c.json({ object: "list", data });
 });
 
 async function requireSession(): Promise<Error | null> {
@@ -117,11 +177,6 @@ async function requireSession(): Promise<Error | null> {
 
 app.post("/v1/chat/completions", async (c) => {
   const startedAt = Date.now();
-  const sessionErr = await requireSession();
-  if (sessionErr) {
-    logRequest(c, 401, startedAt, { error: sessionErr.message });
-    return c.json(openAiErrorBody(sessionErr), 401);
-  }
 
   let req: OpenAiChatRequest;
   try {
@@ -141,13 +196,32 @@ app.post("/v1/chat/completions", async (c) => {
     );
   }
 
-  const perchOpts = toPerchOptions(req);
-  const bucket = take("global");
   const modelId = req.model ?? "auto";
+  const upstream = selectUpstream(modelId);
+
+  if (upstream.cc) {
+    if (!(await getCcAuth())) {
+      const msg = "No Command Code key. Run `cmdc login` or set COMMANDCODE_API_KEY.";
+      logRequest(c, 401, startedAt, { error: msg });
+      return c.json(openAiErrorBody(new Error(msg)), 401);
+    }
+  } else {
+    const sessionErr = await requireSession();
+    if (sessionErr) {
+      logRequest(c, 401, startedAt, { error: sessionErr.message });
+      return c.json(openAiErrorBody(sessionErr), 401);
+    }
+  }
+
+  const perchOpts = toPerchOptions(req);
+  const upstreamOpts: AnyUpstreamOpts = upstream.cc
+    ? toCcOptions(req, modelId)
+    : perchOpts;
+  const bucket = take("global");
 
   if (!req.stream) {
     try {
-      const done = await callNonStreaming(perchOpts, c.req.raw.signal);
+      const done = await upstream.nonStreaming(upstreamOpts, c.req.raw.signal);
       const result = fromDoneEvent(done);
       const message: Record<string, unknown> = {
         role: "assistant",
@@ -214,7 +288,7 @@ app.post("/v1/chat/completions", async (c) => {
       let usage: Record<string, number> | null = null;
       let emittedToolCalls = false;
 
-      for await (const ev of callStreaming(perchOpts, c.req.raw.signal)) {
+      for await (const ev of upstream.streaming(upstreamOpts, c.req.raw.signal)) {
         if (ev.type === "__http_error") {
           streamMeta.error = String((ev as { message?: string }).message ?? "upstream error");
           const body = openAiErrorBody(ev as unknown as Error & { type: string });
@@ -304,11 +378,6 @@ app.post("/v1/chat/completions", async (c) => {
 
 app.post("/v1/responses", async (c) => {
   const startedAt = Date.now();
-  const sessionErr = await requireSession();
-  if (sessionErr) {
-    logRequest(c, 401, startedAt, { error: sessionErr.message });
-    return c.json({ error: { message: sessionErr.message } }, 401);
-  }
 
   let req: ResponsesRequest;
   try {
@@ -327,13 +396,32 @@ app.post("/v1/responses", async (c) => {
     );
   }
 
+  const modelId = req.model ?? "auto";
+  const upstream = selectUpstream(modelId);
+
+  if (upstream.cc) {
+    if (!(await getCcAuth())) {
+      const msg = "No Command Code key. Run `cmdc login` or set COMMANDCODE_API_KEY.";
+      logRequest(c, 401, startedAt, { error: msg });
+      return c.json({ error: { message: msg } }, 401);
+    }
+  } else {
+    const sessionErr = await requireSession();
+    if (sessionErr) {
+      logRequest(c, 401, startedAt, { error: sessionErr.message });
+      return c.json({ error: { message: sessionErr.message } }, 401);
+    }
+  }
+
   const bucket = take("global");
   const perchOpts = toPerchOptions(chatReq);
-  const modelId = req.model ?? "auto";
+  const upstreamOpts: AnyUpstreamOpts = upstream.cc
+    ? toCcOptions(chatReq, modelId)
+    : perchOpts;
 
   if (!req.stream) {
     try {
-      const done = await callNonStreaming(perchOpts, c.req.raw.signal);
+      const done = await upstream.nonStreaming(upstreamOpts, c.req.raw.signal);
       const result = fromDoneEvent(done);
       logRequest(c, 200, startedAt, {
         model: modelId,
@@ -418,7 +506,7 @@ app.post("/v1/responses", async (c) => {
 
       let finalUsage: Record<string, number> | null = null;
 
-      for await (const ev of callStreaming(perchOpts, c.req.raw.signal)) {
+      for await (const ev of upstream.streaming(upstreamOpts, c.req.raw.signal)) {
         if (ev.type === "__http_error") {
           await sse.writeSSE({
             event: "response.failed",
