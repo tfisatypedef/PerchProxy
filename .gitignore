@@ -8,4 +8,5 @@ dist/
 # Local-only data (not part of the project)
 .perch/
 .commandcode/
+.zcode/
 scratch_cli/
